@@ -6,6 +6,9 @@ import { Input } from "@/components/ui/input"
 
 import { googleDriveService } from "@/lib/googleDrive"
 import { authService } from "@/lib/auth"
+import { searchService } from "@/lib/persistentSearch"
+import { changeSyncService } from "@/lib/changeSync"
+import { indexGoogleDriveJob } from "@/jobs/indexGoogleDrive"
 import type { DriveFile, SearchState } from "~types"
 
 interface SearchInterfaceProps {
@@ -40,45 +43,55 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
   })
   const [isAuthenticated, setIsAuthenticated] = useState(false)
   const [isInitializing, setIsInitializing] = useState(true)
+  const [isIndexed, setIsIndexed] = useState(false)
+  const [isIndexing, setIsIndexing] = useState(false)
   
   // Debounce search query with 300ms delay
   const debouncedSearchQuery = useDebounce(searchQuery, 300)
 
-  // Initialize authentication on component mount
+  // Initialize authentication and search service on component mount
   useEffect(() => {
-    const initializeAuth = async () => {
+    const initializeApp = async () => {
       setIsInitializing(true)
       try {
+        // Initialize search service first
+        await searchService.initialize()
+        const searchStats = searchService.getStats()
+        setIsIndexed(searchStats.totalFiles > 0)
+        
+        // Then initialize authentication
         const authenticated = await authService.initialize()
         setIsAuthenticated(authenticated)
         
-        if (authenticated) {
-          // Load recent files if authenticated - call search directly to avoid dependency
-          try {
-            const result = await googleDriveService.searchFiles({
-              query: "",
-              maxResults: 20
-            })
-            setSearchState({
-              query: "",
-              results: result.files,
-              hasMore: !!result.nextPageToken,
-              nextPageToken: result.nextPageToken,
-              isLoading: false,
-              error: undefined
-            })
-          } catch (error) {
-            console.error("Failed to load initial files:", error)
-          }
+        if (authenticated && searchStats.totalFiles > 0) {
+          // If we have an index, load recent files from it
+          const recentFiles = searchService.search('', 20) // Empty query returns recent files
+          setSearchState({
+            query: "",
+            results: recentFiles,
+            hasMore: false,
+            isLoading: false,
+            error: undefined
+          })
+          
+          // Start periodic change sync to keep index updated
+          changeSyncService.startPeriodicSync()
+        } else if (authenticated && searchStats.totalFiles === 0) {
+          // No index exists, show indexing option
+          console.log('No search index found. User should run initial indexing.')
         }
       } catch (error) {
-        console.error("Failed to initialize authentication:", error)
+        console.error("Failed to initialize app:", error)
+        setSearchState(prev => ({
+          ...prev,
+          error: error instanceof Error ? error.message : "Initialization failed"
+        }))
       } finally {
         setIsInitializing(false)
       }
     }
     
-    initializeAuth()
+    initializeApp()
   }, [])
 
   const handleSearch = useCallback(async (query: string) => {
@@ -90,16 +103,25 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
     setSearchState(prev => ({ ...prev, isLoading: true, error: undefined, query }))
 
     try {
-      const result = await googleDriveService.searchFiles({
-        query: query.trim(),
-        maxResults: 20
-      })
+      let results: DriveFile[]
+      
+      if (isIndexed) {
+        // Use lightning-fast persistent search
+        results = searchService.search(query.trim(), 20)
+      } else {
+        // Fallback to direct API search if no index
+        console.log('No search index available, using direct API search')
+        const result = await googleDriveService.searchFiles({
+          query: query.trim(),
+          maxResults: 20
+        })
+        results = result.files
+      }
       
       setSearchState(prev => ({
         ...prev,
-        results: result.files,
-        hasMore: !!result.nextPageToken,
-        nextPageToken: result.nextPageToken,
+        results,
+        hasMore: false, // For indexed search, we show all results at once
         isLoading: false
       }))
     } catch (error) {
@@ -109,7 +131,7 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
         error: error instanceof Error ? error.message : "Search failed"
       }))
     }
-  }, [])
+  }, [isIndexed])
 
   // Trigger search when debounced query changes
   useEffect(() => {
@@ -124,8 +146,14 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
       const success = await googleDriveService.authenticate()
       if (success) {
         setIsAuthenticated(true)
-        // Load recent files after successful authentication
-        await handleSearch("")
+        // After authentication, check if we need to index
+        const searchStats = searchService.getStats()
+        if (searchStats.totalFiles === 0) {
+          console.log('No search index found after authentication')
+        } else {
+          // Load recent files from index
+          await handleSearch("")
+        }
       }
     } catch (error) {
       setSearchState(prev => ({
@@ -138,10 +166,61 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
     }
   }
 
+  const handleBuildIndex = async () => {
+    if (!isAuthenticated) {
+      setSearchState(prev => ({
+        ...prev,
+        error: "Please authenticate first"
+      }))
+      return
+    }
+
+    setIsIndexing(true)
+    setSearchState(prev => ({ ...prev, isLoading: true, error: undefined }))
+
+    try {
+      console.log('🚀 Starting Google Drive indexing...')
+      const result = await indexGoogleDriveJob({ force: true })
+      
+      if (result.success) {
+        setIsIndexed(true)
+        console.log(`✅ Indexing completed: ${result.filesIndexed} files indexed`)
+        
+        // Load initial results from the new index
+        const recentFiles = searchService.search('', 20)
+        setSearchState({
+          query: "",
+          results: recentFiles,
+          hasMore: false,
+          isLoading: false,
+          error: undefined
+        })
+        
+        // Start periodic change sync now that we have an index
+        changeSyncService.startPeriodicSync()
+      } else {
+        throw new Error(`Indexing failed: ${result.errors.join(', ')}`)
+      }
+    } catch (error) {
+      console.error('❌ Indexing failed:', error)
+      setSearchState(prev => ({
+        ...prev,
+        isLoading: false,
+        error: error instanceof Error ? error.message : "Indexing failed"
+      }))
+    } finally {
+      setIsIndexing(false)
+    }
+  }
+
   const handleSignOut = async () => {
     try {
+      // Stop change sync when signing out
+      changeSyncService.stopPeriodicSync()
+      
       await authService.signOut()
       setIsAuthenticated(false)
+      setIsIndexed(false)
       setSearchState({
         query: "",
         results: [],
@@ -155,6 +234,11 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
   }
 
   const openFile = (file: DriveFile) => {
+    // Track file usage for better ranking
+    if (isIndexed) {
+      searchService.trackFileOpen(file.id)
+    }
+
     if (file.webViewLink) {
       if (typeof chrome !== "undefined" && chrome.tabs) {
         // Extension context
@@ -254,6 +338,23 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
             {isInitializing ? "Connecting..." : "Connect Google Drive"}
           </Button>
         </div>
+      ) : !isIndexed ? (
+        <div className="text-center space-y-6">
+          <div className="space-y-2">
+            <h2 className="text-lg font-medium">Build Search Index</h2>
+            <p className="text-sm text-muted-foreground">
+              Index your Google Drive files for lightning-fast search
+            </p>
+          </div>
+          <Button onClick={handleBuildIndex} disabled={isIndexing}>
+            {isIndexing ? "Building Index..." : "Build Index"}
+          </Button>
+          {isIndexing && (
+            <p className="text-xs text-muted-foreground mt-2">
+              This may take a few minutes depending on your file count
+            </p>
+          )}
+        </div>
       ) : (
         <div className="space-y-4">
           {/* Search Bar */}
@@ -267,17 +368,28 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
               className="pl-10 h-12 text-base bg-background border-0 shadow-sm ring-1 ring-border focus:ring-2 focus:ring-ring rounded-lg"
               autoFocus
             />
-            {/* Subtle sign out option in corner */}
-            {isAuthenticated && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={handleSignOut}
-                className="absolute right-2 top-1/2 transform -translate-y-1/2 h-8 px-2 text-xs text-muted-foreground hover:text-foreground"
-              >
-                <LogOut className="h-3 w-3" />
-              </Button>
-            )}
+            {/* Status indicators and actions */}
+            <div className="absolute right-2 top-1/2 transform -translate-y-1/2 flex items-center gap-2">
+              {/* Index status indicator */}
+              {isAuthenticated && isIndexed && (
+                <div className="text-xs text-green-600 flex items-center gap-1">
+                  <div className="w-2 h-2 bg-green-500 rounded-full"></div>
+                  <span>Indexed</span>
+                </div>
+              )}
+              
+              {/* Sign out button */}
+              {isAuthenticated && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={handleSignOut}
+                  className="h-8 px-2 text-xs text-muted-foreground hover:text-foreground"
+                >
+                  <LogOut className="h-3 w-3" />
+                </Button>
+              )}
+            </div>
           </div>
 
           {/* Loading State */}

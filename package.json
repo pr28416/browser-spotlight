@@ -5,13 +5,16 @@
   "description": "A spotlight search for your browser - quickly find and open files from cloud storage",
   "author": "Pranav Ramesh",
   "scripts": {
-    "start": "next start",
     "dev": "run-p dev:*",
-    "dev:plasmo": "plasmo dev",
     "dev:next": "next dev --port 1947",
+    "dev:plasmo": "plasmo dev",
     "build": "run-p build:*",
+    "build:next": "next build",
     "build:plasmo": "plasmo build",
-    "build:next": "next build"
+    "start": "next start",
+    "index:build": "tsx src/jobs/indexGoogleDrive.ts",
+    "index:force": "tsx src/jobs/indexGoogleDrive.ts --force",
+    "index:sync": "tsx src/jobs/indexGoogleDrive.ts --incremental"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.15",
@@ -24,6 +27,7 @@
     "fuse.js": "^7.1.0",
     "googleapis": "^160.0.0",
     "lucide-react": "^0.544.0",
+    "minisearch": "^7.2.0",
     "next": "14.1.0",
     "npm-run-all": "^4.1.5",
     "plasmo": "0.90.5",
