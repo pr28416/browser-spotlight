@@ -211,7 +211,32 @@ class AuthService {
   }
 
   getAccessToken(): string | undefined {
-    return this.isAuthenticated() ? this.authState.accessToken : undefined
+    return this.authState.accessToken
+  }
+
+  async getUserInfo(): Promise<{ email?: string; name?: string } | null> {
+    const accessToken = this.getAccessToken()
+    if (!accessToken) return null
+
+    try {
+      const response = await fetch('https://www.googleapis.com/oauth2/v1/userinfo', {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`
+        }
+      })
+
+      if (response.ok) {
+        const userInfo = await response.json()
+        return {
+          email: userInfo.email,
+          name: userInfo.name
+        }
+      }
+    } catch (error) {
+      console.error('Failed to get user info:', error)
+    }
+
+    return null
   }
 }
 

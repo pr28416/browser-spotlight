@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback, useMemo } from "react"
-import { Search, FileText, FileSpreadsheet, File, LogOut } from "lucide-react"
+import { useState, useEffect, useCallback, useMemo, useRef } from "react"
+import { Search, FileText, FileSpreadsheet, File } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -9,6 +9,7 @@ import { authService } from "@/lib/auth"
 import { searchService } from "@/lib/persistentSearch"
 import { changeSyncService } from "@/lib/changeSync"
 import { indexGoogleDriveJob } from "@/jobs/indexGoogleDrive"
+import { SettingsModal } from "@/components/SettingsModal"
 import type { DriveFile, SearchState } from "~types"
 
 interface SearchInterfaceProps {
@@ -45,6 +46,9 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
   const [isInitializing, setIsInitializing] = useState(true)
   const [isIndexed, setIsIndexed] = useState(false)
   const [isIndexing, setIsIndexing] = useState(false)
+  const [visibleCount, setVisibleCount] = useState(25) // Start with 25 visible items
+  const [userEmail, setUserEmail] = useState<string | undefined>()
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
   
   // Debounce search query with 300ms delay
   const debouncedSearchQuery = useDebounce(searchQuery, 300)
@@ -62,6 +66,12 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
         // Then initialize authentication
         const authenticated = await authService.initialize()
         setIsAuthenticated(authenticated)
+        
+        // Get user info if authenticated
+        if (authenticated) {
+          const userInfo = await authService.getUserInfo()
+          setUserEmail(userInfo?.email)
+        }
         
         if (authenticated && searchStats.totalFiles > 0) {
           // If we have an index, load recent files from it
@@ -136,9 +146,32 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
   // Trigger search when debounced query changes
   useEffect(() => {
     if (isAuthenticated && !isInitializing) {
+      setVisibleCount(25) // Reset visible count on new search
       handleSearch(debouncedSearchQuery)
     }
   }, [debouncedSearchQuery, isAuthenticated, isInitializing, handleSearch])
+
+  // Handle scroll-based lazy loading
+  const handleScroll = useCallback(() => {
+    const container = scrollContainerRef.current
+    if (!container || visibleCount >= searchState.results.length) return
+
+    const { scrollTop, scrollHeight, clientHeight } = container
+    const isNearBottom = scrollTop + clientHeight >= scrollHeight - 100 // Load more when 100px from bottom
+
+    if (isNearBottom) {
+      setVisibleCount(prev => Math.min(prev + 25, searchState.results.length))
+    }
+  }, [visibleCount, searchState.results.length])
+
+  // Attach scroll listener
+  useEffect(() => {
+    const container = scrollContainerRef.current
+    if (!container) return
+
+    container.addEventListener('scroll', handleScroll, { passive: true })
+    return () => container.removeEventListener('scroll', handleScroll)
+  }, [handleScroll])
 
   const handleAuthenticate = async () => {
     setIsInitializing(true)
@@ -146,6 +179,11 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
       const success = await googleDriveService.authenticate()
       if (success) {
         setIsAuthenticated(true)
+        
+        // Get user info
+        const userInfo = await authService.getUserInfo()
+        setUserEmail(userInfo?.email)
+        
         // After authentication, check if we need to index
         const searchStats = searchService.getStats()
         if (searchStats.totalFiles === 0) {
@@ -221,6 +259,7 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
       await authService.signOut()
       setIsAuthenticated(false)
       setIsIndexed(false)
+      setUserEmail(undefined)
       setSearchState({
         query: "",
         results: [],
@@ -378,16 +417,9 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
                 </div>
               )}
               
-              {/* Sign out button */}
+              {/* Settings button */}
               {isAuthenticated && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={handleSignOut}
-                  className="h-8 px-2 text-xs text-muted-foreground hover:text-foreground"
-                >
-                  <LogOut className="h-3 w-3" />
-                </Button>
+                <SettingsModal onSignOut={handleSignOut} userEmail={userEmail} />
               )}
             </div>
           </div>
@@ -408,32 +440,55 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
 
           {/* Results List */}
           {searchState.results.length > 0 && (
-            <div className="space-y-1 max-h-96 overflow-y-auto">
-              {searchState.results.map((file) => (
-                <div
-                  key={file.id}
-                  className="flex items-center gap-3 p-3 rounded-lg hover:bg-muted/50 cursor-pointer transition-colors group"
-                  onClick={() => openFile(file)}
-                >
-                  <div className="flex-shrink-0 group-hover:scale-110 transition-transform">
-                    {getFileIcon(file.mimeType)}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="font-medium text-sm truncate group-hover:text-foreground transition-colors">
-                      {file.name}
+            <div className="space-y-2">
+              {/* Results summary */}
+              <div className="text-xs text-muted-foreground px-1">
+                Showing {Math.min(visibleCount, searchState.results.length)} of {searchState.results.length} results
+              </div>
+              
+              {/* Virtual scrolling container */}
+              <div 
+                ref={scrollContainerRef}
+                className="max-h-96 overflow-y-auto"
+              >
+                <div className="space-y-1">
+                  {/* Only render visible items */}
+                  {searchState.results.slice(0, visibleCount).map((file) => (
+                    <div
+                      key={file.id}
+                      className="flex items-center gap-3 p-3 rounded-lg hover:bg-muted/50 cursor-pointer transition-colors group"
+                      onClick={() => openFile(file)}
+                    >
+                      <div className="flex-shrink-0 group-hover:scale-110 transition-transform">
+                        {getFileIcon(file.mimeType)}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="font-medium text-sm truncate group-hover:text-foreground transition-colors">
+                          {file.name}
+                        </div>
+                        <div className="text-xs text-muted-foreground mt-0.5 flex items-center gap-2">
+                          <span>{getFileTypeLabel(file.mimeType)}</span>
+                          {file.modifiedTime && (
+                            <>
+                              <span className="text-muted-foreground/60">•</span>
+                              <span>Modified {formatModifiedTime(file.modifiedTime)}</span>
+                            </>
+                          )}
+                        </div>
+                      </div>
                     </div>
-                    <div className="text-xs text-muted-foreground mt-0.5 flex items-center gap-2">
-                      <span>{getFileTypeLabel(file.mimeType)}</span>
-                      {file.modifiedTime && (
-                        <>
-                          <span className="text-muted-foreground/60">•</span>
-                          <span>Modified {formatModifiedTime(file.modifiedTime)}</span>
-                        </>
-                      )}
+                  ))}
+                  
+                  {/* Loading indicator for more results */}
+                  {visibleCount < searchState.results.length && (
+                    <div className="flex justify-center py-2">
+                      <div className="text-xs text-muted-foreground animate-pulse">
+                        Scroll to load more...
+                      </div>
                     </div>
-                  </div>
+                  )}
                 </div>
-              ))}
+              </div>
             </div>
           )}
 

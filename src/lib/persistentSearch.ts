@@ -259,32 +259,66 @@ export class PersistentSearchService {
     }
 
     const start = performance.now()
+    const searchTerm = query.trim().toLowerCase()
     
-    const results = this.miniSearch.search(query, {
-      limit,
-      // Apply dynamic ranking boosts
-      boostDocument: (docId, term, storedFields) => {
-        const file = this.fileMap.get(docId)
-        if (!file) return 1
+    // Try multiple search strategies for best results
+    let results: any[] = []
+    
+    try {
+      // Strategy 1: Standard search with prefix enabled
+      results = this.miniSearch.search(searchTerm, {
+        limit,
+        prefix: true, // Enable prefix matching
+        fuzzy: 0.2,
+        combineWith: 'OR', // Use OR for better recall on partial matches
+        // Apply dynamic ranking boosts
+        boostDocument: (docId, term, storedFields) => {
+          const file = this.fileMap.get(docId)
+          if (!file) return 1
 
-        let boost = 1
-        
-        // Recency boost (exponential decay over 30 days)
-        if (file.modifiedTime) {
-          const daysSinceModified = (Date.now() - new Date(file.modifiedTime).getTime()) / (1000 * 60 * 60 * 24)
-          const recencyBoost = Math.exp(-daysSinceModified / 30)
-          boost += recencyBoost * 0.3
+          let boost = 1
+          
+          // Exact name match gets highest boost
+          if (file.name.toLowerCase().includes(searchTerm)) {
+            boost += 2
+          }
+          
+          // Name starts with query gets high boost
+          if (file.name.toLowerCase().startsWith(searchTerm)) {
+            boost += 1.5
+          }
+          
+          // Recency boost (exponential decay over 30 days)
+          if (file.modifiedTime) {
+            const daysSinceModified = (Date.now() - new Date(file.modifiedTime).getTime()) / (1000 * 60 * 60 * 24)
+            const recencyBoost = Math.exp(-daysSinceModified / 30)
+            boost += recencyBoost * 0.3
+          }
+          
+          // Frequency boost (if we track file opens)
+          if (file.openCount) {
+            const frequencyBoost = Math.log(1 + file.openCount)
+            boost += frequencyBoost * 0.2
+          }
+          
+          return boost
         }
-        
-        // Frequency boost (if we track file opens)
-        if (file.openCount) {
-          const frequencyBoost = Math.log(1 + file.openCount)
-          boost += frequencyBoost * 0.2
-        }
-        
-        return boost
+      })
+      
+      // If no results with fuzzy search, try exact prefix match
+      if (results.length === 0) {
+        results = this.miniSearch.search(searchTerm, {
+          limit,
+          prefix: true,
+          fuzzy: false, // No fuzzy for exact prefix
+          combineWith: 'OR'
+        })
       }
-    })
+      
+    } catch (error) {
+      console.error('Search error:', error)
+      results = []
+    }
 
     const searchTime = performance.now() - start
     console.log(`🔍 Search "${query}" found ${results.length} results in ${Math.round(searchTime)}ms`)
@@ -400,11 +434,22 @@ export class PersistentSearchService {
   // Helper methods - fileExists is no longer needed as we use storage.exists()
 
   private tokenizePath(name: string): string {
-    // For Google Drive, tokenize the filename for better matching
-    return name
-      .replace(/[._-]/g, ' ') // Replace separators with spaces
-      .replace(/([a-z])([A-Z])/g, '$1 $2') // Split camelCase
+    // Enhanced tokenization for better searching
+    let tokenized = name
+      // Replace common separators with spaces
+      .replace(/[._\-+]/g, ' ')
+      // Split camelCase (e.g., "fileName" -> "file Name")
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      // Split numbers from letters (e.g., "12345test" -> "12345 test")
+      .replace(/(\d+)([a-zA-Z])/g, '$1 $2')
+      .replace(/([a-zA-Z])(\d+)/g, '$1 $2')
+      // Normalize whitespace
+      .replace(/\s+/g, ' ')
+      .trim()
       .toLowerCase()
+    
+    // Also include the original filename as a token for exact matches
+    return `${tokenized} ${name.toLowerCase()}`
   }
 
   private getTypeKeywords(mimeType: string): string {
