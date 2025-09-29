@@ -16,6 +16,25 @@ interface FileMetadata extends DriveFile {
   lastOpenedTime?: string
 }
 
+// Filter types for search
+export type FileTypeFilter = 
+  | 'documents' 
+  | 'spreadsheets' 
+  | 'presentations' 
+  | 'pdfs' 
+  | 'folders' 
+  | 'images' 
+  | 'videos' 
+  | 'audio'
+
+export interface SearchFilters {
+  fileTypes?: FileTypeFilter[]
+  dateRange?: {
+    start?: Date
+    end?: Date
+  }
+}
+
 export class PersistentSearchService {
   private miniSearch: MiniSearch<SearchableFile>
   private fileMap: Map<string, FileMetadata> = new Map()
@@ -251,9 +270,9 @@ export class PersistentSearchService {
   }
 
   /**
-   * Search the index
+   * Search the index with optional filters
    */
-  search(query: string, limit: number = 20): FileMetadata[] {
+  search(query: string, limit: number = 20, filters?: SearchFilters): FileMetadata[] {
     if (!this.isReady || !query.trim()) {
       return []
     }
@@ -264,6 +283,37 @@ export class PersistentSearchService {
     // Try multiple search strategies for best results
     let results: any[] = []
     
+    // Create filter function if filters are provided
+    const createFilter = (filters?: SearchFilters) => {
+      if (!filters || (!filters.fileTypes?.length && !filters.dateRange)) {
+        return undefined // No filtering needed
+      }
+
+      return (result: any) => {
+        const file = this.fileMap.get(result.id)
+        if (!file) return false
+
+        // File type filtering
+        if (filters.fileTypes?.length) {
+          const matchesFileType = filters.fileTypes.some(filterType => 
+            this.matchesFileType(file.mimeType, filterType)
+          )
+          if (!matchesFileType) return false
+        }
+
+        // Date range filtering
+        if (filters.dateRange && file.modifiedTime) {
+          const fileDate = new Date(file.modifiedTime)
+          if (filters.dateRange.start && fileDate < filters.dateRange.start) return false
+          if (filters.dateRange.end && fileDate > filters.dateRange.end) return false
+        }
+
+        return true
+      }
+    }
+
+    const filterFn = createFilter(filters)
+
     try {
       // Strategy 1: Standard search with prefix enabled
       results = this.miniSearch.search(searchTerm, {
@@ -271,6 +321,7 @@ export class PersistentSearchService {
         prefix: true, // Enable prefix matching
         fuzzy: 0.2,
         combineWith: 'OR', // Use OR for better recall on partial matches
+        filter: filterFn, // Apply filters
         // Apply dynamic ranking boosts
         boostDocument: (docId, term, storedFields) => {
           const file = this.fileMap.get(docId)
@@ -311,7 +362,8 @@ export class PersistentSearchService {
           limit,
           prefix: true,
           fuzzy: false, // No fuzzy for exact prefix
-          combineWith: 'OR'
+          combineWith: 'OR',
+          filter: filterFn // Apply same filters
         })
       }
       
@@ -465,6 +517,50 @@ export class PersistentSearchService {
     if (mimeType.includes('audio')) keywords.push('audio', 'music', 'sound')
     
     return keywords.join(' ')
+  }
+
+  private matchesFileType(mimeType: string, filterType: FileTypeFilter): boolean {
+    switch (filterType) {
+      case 'documents':
+        return mimeType.includes('document')
+      case 'spreadsheets':
+        return mimeType.includes('spreadsheet')
+      case 'presentations':
+        return mimeType.includes('presentation')
+      case 'pdfs':
+        return mimeType.includes('pdf')
+      case 'folders':
+        return mimeType.includes('folder')
+      case 'images':
+        return mimeType.includes('image')
+      case 'videos':
+        return mimeType.includes('video')
+      case 'audio':
+        return mimeType.includes('audio')
+      default:
+        return false
+    }
+  }
+
+  // Convenience methods for common filters
+  searchDocuments(query: string, limit: number = 20): FileMetadata[] {
+    return this.search(query, limit, { fileTypes: ['documents'] })
+  }
+
+  searchSpreadsheets(query: string, limit: number = 20): FileMetadata[] {
+    return this.search(query, limit, { fileTypes: ['spreadsheets'] })
+  }
+
+  searchPresentations(query: string, limit: number = 20): FileMetadata[] {
+    return this.search(query, limit, { fileTypes: ['presentations'] })
+  }
+
+  searchFolders(query: string, limit: number = 20): FileMetadata[] {
+    return this.search(query, limit, { fileTypes: ['folders'] })
+  }
+
+  searchByFileTypes(query: string, fileTypes: FileTypeFilter[], limit: number = 20): FileMetadata[] {
+    return this.search(query, limit, { fileTypes })
   }
 }
 

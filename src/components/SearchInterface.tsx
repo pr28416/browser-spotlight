@@ -10,7 +10,9 @@ import { searchService } from "@/lib/persistentSearch"
 import { changeSyncService } from "@/lib/changeSync"
 import { indexGoogleDriveJob } from "@/jobs/indexGoogleDrive"
 import { SettingsModal } from "@/components/SettingsModal"
+import { FilterableSearchInput } from "@/components/FilterableSearchInput"
 import type { DriveFile, SearchState } from "~types"
+import type { FileTypeFilter, SearchFilters } from "@/lib/persistentSearch"
 
 interface SearchInterfaceProps {
   title?: string
@@ -48,6 +50,7 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
   const [isIndexing, setIsIndexing] = useState(false)
   const [visibleCount, setVisibleCount] = useState(25) // Start with 25 visible items
   const [userEmail, setUserEmail] = useState<string | undefined>()
+  const [selectedResultIndex, setSelectedResultIndex] = useState(0) // Track selected result for keyboard navigation
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   
   // Debounce search query with 300ms delay
@@ -104,26 +107,28 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
     initializeApp()
   }, [])
 
-  const handleSearch = useCallback(async (query: string) => {
+  const handleSearch = useCallback(async (query: string, filters: FileTypeFilter[] = []) => {
     if (!googleDriveService.isAuthenticated()) {
       setSearchState(prev => ({ ...prev, error: "Not authenticated" }))
       return
     }
 
     setSearchState(prev => ({ ...prev, isLoading: true, error: undefined, query }))
+    setVisibleCount(25) // Reset visible count on new search
 
     try {
       let results: DriveFile[]
       
       if (isIndexed) {
-        // Use lightning-fast persistent search
-        results = searchService.search(query.trim(), 20)
+        // Use lightning-fast persistent search with filters
+        const searchFilters: SearchFilters | undefined = filters.length > 0 ? { fileTypes: filters } : undefined
+        results = searchService.search(query.trim(), 1000, searchFilters) // Get up to 1000 results
       } else {
         // Fallback to direct API search if no index
         console.log('No search index available, using direct API search')
         const result = await googleDriveService.searchFiles({
           query: query.trim(),
-          maxResults: 20
+          maxResults: 50 // Limit API results
         })
         results = result.files
       }
@@ -131,9 +136,12 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
       setSearchState(prev => ({
         ...prev,
         results,
-        hasMore: false, // For indexed search, we show all results at once
+        hasMore: results.length > 50, // Show "load more" if we have more than 50 results
         isLoading: false
       }))
+      
+      // Reset selected index when results change
+      setSelectedResultIndex(0)
     } catch (error) {
       setSearchState(prev => ({
         ...prev,
@@ -142,14 +150,45 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
       }))
     }
   }, [isIndexed])
-
-  // Trigger search when debounced query changes
-  useEffect(() => {
+  // Handle search with filters from FilterableSearchInput
+  const handleFilterableSearch = useCallback((query: string, filters: FileTypeFilter[]) => {
+    // Don't update searchQuery here to avoid infinite loops
     if (isAuthenticated && !isInitializing) {
-      setVisibleCount(25) // Reset visible count on new search
-      handleSearch(debouncedSearchQuery)
+      setVisibleCount(25)
+      setSelectedResultIndex(0) // Reset selection when user types
+      handleSearch(query, filters)
     }
-  }, [debouncedSearchQuery, isAuthenticated, isInitializing, handleSearch])
+  }, [isAuthenticated, isInitializing, handleSearch])
+
+
+  // Auto-scroll to keep selected item visible
+  useEffect(() => {
+    if (!scrollContainerRef.current || selectedResultIndex < 0) return
+
+    const container = scrollContainerRef.current
+    const selectedElement = container.children[0]?.children[selectedResultIndex] as HTMLElement
+    
+    if (selectedElement) {
+      const containerRect = container.getBoundingClientRect()
+      const elementRect = selectedElement.getBoundingClientRect()
+      
+      if (elementRect.bottom > containerRect.bottom) {
+        // Scroll down to show the selected item
+        selectedElement.scrollIntoView({ behavior: 'smooth', block: 'end' })
+      } else if (elementRect.top < containerRect.top) {
+        // Scroll up to show the selected item
+        selectedElement.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      }
+    }
+  }, [selectedResultIndex])
+
+  // Disable the old debounced search since we're using FilterableSearchInput now
+  // useEffect(() => {
+  //   if (isAuthenticated && !isInitializing) {
+  //     setVisibleCount(25)
+  //     handleSearch(debouncedSearchQuery)
+  //   }
+  // }, [debouncedSearchQuery, isAuthenticated, isInitializing, handleSearch])
 
   // Handle scroll-based lazy loading
   const handleScroll = useCallback(() => {
@@ -292,6 +331,31 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
     }
   }
 
+  // Handle keyboard navigation
+  const handleKeyNavigation = useCallback((e: React.KeyboardEvent) => {
+    // Only handle navigation if we have results and no filter popup is showing
+    if (!searchState.results.length || e.defaultPrevented) return
+
+    switch (e.key) {
+      case 'ArrowDown':
+        e.preventDefault()
+        setSelectedResultIndex(prev => 
+          prev < Math.min(visibleCount - 1, searchState.results.length - 1) ? prev + 1 : prev
+        )
+        break
+      case 'ArrowUp':
+        e.preventDefault()
+        setSelectedResultIndex(prev => prev > 0 ? prev - 1 : 0)
+        break
+      case 'Enter':
+        e.preventDefault()
+        if (searchState.results[selectedResultIndex]) {
+          openFile(searchState.results[selectedResultIndex])
+        }
+        break
+    }
+  }, [searchState.results, selectedResultIndex, visibleCount])
+
   const getFileIcon = (mimeType: string) => {
     if (mimeType.includes('document')) {
       return <FileText className="h-5 w-5 text-blue-500" />
@@ -397,32 +461,30 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
       ) : (
         <div className="space-y-4">
           {/* Search Bar */}
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-            <Input
-              type="text"
-              placeholder="Search files..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="pl-10 h-12 text-base bg-background border-0 shadow-sm ring-1 ring-border focus:ring-2 focus:ring-ring rounded-lg"
-              autoFocus
-            />
-            {/* Status indicators and actions */}
-            <div className="absolute right-2 top-1/2 transform -translate-y-1/2 flex items-center gap-2">
-              {/* Index status indicator */}
-              {isAuthenticated && isIndexed && (
-                <div className="text-xs text-green-600 flex items-center gap-1">
-                  <div className="w-2 h-2 bg-green-500 rounded-full"></div>
-                  <span>Indexed</span>
-                </div>
-              )}
-              
-              {/* Settings button */}
-              {isAuthenticated && (
-                <SettingsModal onSignOut={handleSignOut} userEmail={userEmail} />
-              )}
-            </div>
-          </div>
+          <FilterableSearchInput
+            placeholder="Search files... (try @docs, @sheets)"
+            value={searchQuery}
+            onSearchChange={handleFilterableSearch}
+            onKeyDown={handleKeyNavigation}
+            className="h-12 text-base bg-background border-0 shadow-sm ring-1 ring-border focus:ring-2 focus:ring-ring rounded-lg"
+            autoFocus
+            rightSlot={
+              <>
+                {/* Index status indicator */}
+                {isAuthenticated && isIndexed && (
+                  <div className="text-xs text-green-600 flex items-center gap-1">
+                    <div className="w-2 h-2 bg-green-500 rounded-full"></div>
+                    <span>Indexed</span>
+                  </div>
+                )}
+                
+                {/* Settings button */}
+                {isAuthenticated && (
+                  <SettingsModal onSignOut={handleSignOut} userEmail={userEmail} />
+                )}
+              </>
+            }
+          />
 
           {/* Loading State */}
           {searchState.isLoading && (
@@ -453,10 +515,14 @@ export function SearchInterface({ title = "Browser Spotlight" }: SearchInterface
               >
                 <div className="space-y-1">
                   {/* Only render visible items */}
-                  {searchState.results.slice(0, visibleCount).map((file) => (
+                  {searchState.results.slice(0, visibleCount).map((file, index) => (
                     <div
                       key={file.id}
-                      className="flex items-center gap-3 p-3 rounded-lg hover:bg-muted/50 cursor-pointer transition-colors group"
+                      className={`flex items-center gap-3 p-3 rounded-lg cursor-pointer transition-colors group ${
+                        index === selectedResultIndex 
+                          ? 'bg-primary/10 border border-primary/20' 
+                          : 'hover:bg-muted/50'
+                      }`}
                       onClick={() => openFile(file)}
                     >
                       <div className="flex-shrink-0 group-hover:scale-110 transition-transform">
